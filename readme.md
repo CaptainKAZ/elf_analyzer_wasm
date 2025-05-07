@@ -2,6 +2,8 @@
 
 [![Build and Deploy](https://github.com/CaptainKAZ/elf_analyzer_wasm/actions/workflows/deploy.yml/badge.svg)](https://github.com/CaptainKAZ/elf_analyzer_wasm/actions/workflows/deploy.yml) 
 
+**➡️ [demo](https://captainkaz.github.io/elf_analyzer_wasm/)**
+
 A web-based tool to analyze ELF (Executable and Linkable Format) files, leveraging DWARF debug information to recursively parse variables (including globals and statics) down to their primitive components. It displays the variable's fully qualified name, base type, memory address, size, and declaration location (file/line). Built with Rust and compiled to WebAssembly (Wasm) to run directly in the browser.
 
 
