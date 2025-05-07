@@ -42,7 +42,7 @@ jobs:
       # 步骤 3: 使用 jetli/wasm-pack-action 安装 wasm-pack
       - name: Install wasm-pack using jetli/wasm-pack-action
         uses: jetli/wasm-pack-action@v0.4.0
-        with:
+        # with:
           # 可选：指定要安装的 wasm-pack 版本 (例如 "v0.10.0", "latest")
           # version: 'latest' # 默认就是 latest
 
