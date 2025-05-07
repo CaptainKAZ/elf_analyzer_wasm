@@ -1,0 +1,102 @@
+# .github/workflows/deploy.yml
+
+name: Build and Deploy Rust Wasm to GitHub Pages
+
+# 控制工作流何时运行
+on:
+  # 在推送到 main 分支时触发
+  push:
+    branches: [ "main" ] # 或者你的主分支名，如 master
+  # 允许你从 Actions 标签页手动运行此工作流
+  workflow_dispatch:
+
+# 设置 GITHUB_TOKEN 的权限，允许部署到 GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 只允许一个并发部署，跳过在进行中的运行之间排队的运行。
+# 可选：取消任何仍在运行的先前工作流的推送
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  # 构建任务
+  build:
+    runs-on: ubuntu-latest # 使用最新的 Ubuntu 运行器
+
+    steps:
+      # 步骤 1: 检出你的仓库代码
+      - name: Checkout repository
+        uses: actions/checkout@v4 # 使用最新的 checkout action
+
+      # 步骤 2: 安装 Rust 工具链 (包括 cargo)
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable # 使用稳定版的 Rust
+        with:
+          # 确保安装了 wasm 目标
+          targets: wasm32-unknown-unknown
+
+      # 步骤 3: 使用 jetli/wasm-pack-action 安装 wasm-pack
+      - name: Install wasm-pack using jetli/wasm-pack-action
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          # 可选：指定要安装的 wasm-pack 版本 (例如 "v0.10.0", "latest")
+          # version: 'latest' # 默认就是 latest
+
+      # 步骤 4: 构建 Wasm 包
+      # --target web 会生成适合浏览器的 JS 和 Wasm 文件
+      # 输出目录默认为 ./pkg
+      - name: Build Wasm package
+        run: wasm-pack build --target web --release # 使用 release 构建以优化大小和速度
+
+      # 步骤 5: 准备 GitHub Pages 的内容
+      # 将构建好的 Wasm 包 (pkg目录) 和你的静态文件 (HTML, JS, CSS) 复制到一个部署目录 (例如 ./dist)
+      # **根据你的项目结构调整这里的路径**
+      - name: Prepare deployment artifacts
+        run: |
+          # 创建一个用于部署的目录
+          mkdir ./dist
+          # **复制根目录下的 index.html**
+          cp index.html ./dist/
+          # **如果还有其他 CSS 或资源文件在根目录，也一并复制**
+          # cp style.css ./dist/
+          # 复制构建好的 Wasm 包
+          cp -r pkg ./dist/pkg
+          # **重要：检查 index.html 中 <script type="module"> 导入 Wasm 的路径是否相对于 index.html 正确**
+          # 因为 index.html 在 dist/ 根目录，pkg 在 dist/pkg，路径应为 './pkg/elf_analyzer_wasm.js'
+
+      # 步骤 6: 上传构建产物
+      # 这个步骤会将 ./dist 目录的内容打包为一个 artifact，供后续的部署任务使用
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # 从 ./dist 目录上传
+          path: './dist'
+
+  # 部署任务
+  deploy:
+    # 需要在 build 任务成功后运行
+    needs: build
+
+    # 部署任务的权限
+    permissions:
+      pages: write      # 写入 gh-pages 分支或 Pages 服务
+      id-token: write   # OIDC 令牌，用于无密钥部署
+
+    # 部署环境设置
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }} # 输出部署后的 URL
+
+    # 在 GitHub Pages 的专用运行器上运行
+    runs-on: ubuntu-latest
+
+    steps:
+      # 步骤 7: 执行部署
+      # 这个 Action 会自动从 build 任务上传的 artifact 中获取内容并部署到 GitHub Pages
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
