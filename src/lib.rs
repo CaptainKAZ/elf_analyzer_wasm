@@ -1,23 +1,21 @@
 // src/lib.rs
-// No changes needed here from the previous version (Demangling & Cleaned Logs)
-// Ensure the code is the same as the last correct version provided.
 use wasm_bindgen::prelude::*;
 use serde::Serialize;
 
 use object::{Object, ObjectSection};
 use gimli::{
-    Dwarf, DwarfSections, EndianSlice, RunTimeEndian, Unit, DebugInfoOffset, AttributeValue, Expression, Operation, Encoding
+    Dwarf, DwarfSections, EndianSlice, RunTimeEndian, Unit, DebugInfoOffset, AttributeValue, Expression, Operation
 };
 // Import log macros
-use log::{info, warn, error, debug};
+use log::{info, warn, error, debug}; // Keep debug for potentially useful high-level info
 // Import demangler
 use cpp_demangle::{Symbol, DemangleOptions};
 
 
 const MAX_RECURSION_DEPTH: usize = 15;
-const MAX_SIZE_CALC_DEPTH: usize = 10;
+const MAX_SIZE_CALC_DEPTH: usize = 10; // Depth for get_type_size helper
 
-// Updated structure to include file and line information
+// Structure to hold the "flattened" information for each primitive component
 #[derive(Serialize, Debug, Clone)]
 pub struct BaseVariableInfo {
     name: String,        // Demangled name if C++, original otherwise
@@ -33,10 +31,9 @@ pub struct BaseVariableInfo {
 pub fn start() {
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
-        // Redirect Rust panics to console.error
         console_error_panic_hook::set_once();
-        // Initialize wasm-logger
-        wasm_logger::init(wasm_logger::Config::new(log::Level::Info)); // Default to Info level
+        // Set default log level to Info for production
+        wasm_logger::init(wasm_logger::Config::new(log::Level::Info));
         info!("Wasm module initialized, logger ready.");
     });
 }
@@ -63,11 +60,14 @@ fn get_type_size(
     depth: usize,
 ) -> Option<u64> {
     if depth > MAX_SIZE_CALC_DEPTH { return None; }
+
     let unit_offset = type_offset.to_unit_offset(&unit.header)?;
     let die = unit.entry(unit_offset).ok()?;
+
     if let Some(size) = die.attr_value(gimli::DW_AT_byte_size).ok().flatten().and_then(|a| a.udata_value()) {
         if size > 0 { return Some(size); }
     }
+
     match die.tag() {
         gimli::DW_TAG_pointer_type | gimli::DW_TAG_reference_type => Some(unit.header.address_size() as u64),
         gimli::DW_TAG_typedef | gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type => {
@@ -86,6 +86,7 @@ fn get_type_size(
                     return get_type_size(dwarf, unit, enum_underlying_dio, depth + 1);
                 }
             }
+            // Fallback to DW_AT_byte_size if enum has no explicit underlying type ref but has size
             die.attr_value(gimli::DW_AT_byte_size).ok().flatten().and_then(|a| a.udata_value())
         }
         _ => None,
@@ -100,11 +101,17 @@ pub fn analyze_elf_recursively(elf_bytes: &[u8]) -> Result<JsValue, JsValue> {
 
     let obj_file = match object::File::parse(elf_bytes) {
         Ok(file) => file,
-        Err(e) => return Err(JsValue::from_str(&format!("Failed to parse ELF file: {}", e))),
+        Err(e) => {
+            error!("Failed to parse ELF file: {}", e);
+            return Err(JsValue::from_str(&format!("Failed to parse ELF file: {}", e)));
+        }
     };
 
     let sections = DwarfSections::load(|id| load_section(&obj_file, id))
-        .map_err(|e| JsValue::from_str(&format!("Failed to load DWARF sections: {}", e)))?;
+        .map_err(|e| {
+            error!("Failed to load DWARF sections: {}", e);
+            JsValue::from_str(&format!("Failed to load DWARF sections: {}", e))
+        })?;
 
     let dwarf = sections.borrow(|section| {
         gimli::EndianSlice::new(section, if obj_file.is_little_endian() { RunTimeEndian::Little } else { RunTimeEndian::Big })
@@ -115,7 +122,7 @@ pub fn analyze_elf_recursively(elf_bytes: &[u8]) -> Result<JsValue, JsValue> {
         let unit = match dwarf.unit(header.clone()) {
             Ok(u) => u,
             Err(_e) => {
-                warn!("Failed to parse DWARF unit: {:?}", _e);
+                warn!("Failed to parse DWARF unit at offset {:?}: {:?}", header.offset(), _e);
                 continue;
             }
         };
@@ -144,13 +151,47 @@ fn process_die_node_for_variables<'abbrev, 'unit, 'tree, 'data>(
     let die = node.entry();
 
     if die.tag() == gimli::DW_TAG_variable {
-        let type_attr = die.attr_value(gimli::DW_AT_type).unwrap_or(None);
-        let location_attr = die.attr_value(gimli::DW_AT_location).unwrap_or(None);
-        let name_av = die.attr_value(gimli::DW_AT_linkage_name).unwrap_or(None)
-            .or_else(|| die.attr_value(gimli::DW_AT_MIPS_linkage_name).unwrap_or(None))
-            .or_else(|| die.attr_value(gimli::DW_AT_name).unwrap_or(None));
+        let location_attr_opt = die.attr_value(gimli::DW_AT_location).ok().flatten();
+        let declaration_flag = die.attr_value(gimli::DW_AT_declaration).ok().flatten()
+            .map_or(false, |attr| matches!(attr, AttributeValue::Flag(true)));
+        let specification_attr_opt = die.attr_value(gimli::DW_AT_specification).ok().flatten();
 
-        if let (Some(name_attribute_value), Some(AttributeValue::UnitRef(type_unit_offset)), Some(loc_av)) = (name_av, type_attr, location_attr) {
+        if location_attr_opt.is_none() && specification_attr_opt.is_none() {
+            if declaration_flag { /* Pure declaration, skip direct processing */ }
+            // Still process children for nested variables
+            let mut children_cursor = node.children();
+            while let Some(child_node) = children_cursor.next().unwrap_or(None) {
+                process_die_node_for_variables(child_node, dwarf, unit, results);
+            }
+            return;
+        }
+        
+        let mut name_av_opt: Option<AttributeValue<EndianSlice<RunTimeEndian>, usize>> = None;
+        let mut type_attr_opt: Option<AttributeValue<EndianSlice<RunTimeEndian>, usize>> = None;
+        let mut decl_file_attr_opt: Option<AttributeValue<EndianSlice<RunTimeEndian>, usize>> = None;
+        let mut decl_line_attr_opt: Option<AttributeValue<EndianSlice<RunTimeEndian>, usize>> = None;
+
+        if let Some(AttributeValue::UnitRef(spec_offset)) = specification_attr_opt {
+            if let Ok(spec_die) = unit.entry(spec_offset) {
+                name_av_opt = spec_die.attr_value(gimli::DW_AT_linkage_name).ok().flatten()
+                    .or_else(|| spec_die.attr_value(gimli::DW_AT_MIPS_linkage_name).ok().flatten())
+                    .or_else(|| spec_die.attr_value(gimli::DW_AT_name).ok().flatten());
+                type_attr_opt = spec_die.attr_value(gimli::DW_AT_type).ok().flatten();
+                decl_file_attr_opt = spec_die.attr_value(gimli::DW_AT_decl_file).ok().flatten();
+                decl_line_attr_opt = spec_die.attr_value(gimli::DW_AT_decl_line).ok().flatten();
+            } else {
+                 warn!("Failed to lookup specification DIE at {:?}", spec_offset);
+            }
+        } else {
+            name_av_opt = die.attr_value(gimli::DW_AT_linkage_name).ok().flatten()
+                .or_else(|| die.attr_value(gimli::DW_AT_MIPS_linkage_name).ok().flatten())
+                .or_else(|| die.attr_value(gimli::DW_AT_name).ok().flatten());
+            type_attr_opt = die.attr_value(gimli::DW_AT_type).ok().flatten();
+            decl_file_attr_opt = die.attr_value(gimli::DW_AT_decl_file).ok().flatten();
+            decl_line_attr_opt = die.attr_value(gimli::DW_AT_decl_line).ok().flatten();
+        }
+
+        if let (Some(name_attribute_value), Some(AttributeValue::UnitRef(type_unit_offset)), Some(loc_av_val)) = (name_av_opt, type_attr_opt, location_attr_opt) {
             let raw_var_name = match dwarf.attr_string(unit, name_attribute_value) {
                  Ok(name_slice) => name_slice.to_string_lossy().into_owned(),
                  Err(_) => format!("<unnamed_var_offset_{:?}>", die.offset().0),
@@ -163,7 +204,7 @@ fn process_die_node_for_variables<'abbrev, 'unit, 'tree, 'data>(
             let var_name = demangled_name;
 
             if raw_var_name != var_name {
-                debug!("Demangled '{}' -> '{}'", raw_var_name, var_name);
+                debug!("Demangled '{}' -> '{}'", raw_var_name, var_name); // Keep this debug for C++
             }
 
             let type_debug_info_offset = match type_unit_offset.to_debug_info_offset(&unit.header) {
@@ -174,12 +215,11 @@ fn process_die_node_for_variables<'abbrev, 'unit, 'tree, 'data>(
             let mut file_name: Option<String> = None;
             let mut line_number: Option<u64> = None;
 
-            if let Some(line_attr) = die.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
-                line_number = line_attr.udata_value();
+            if let Some(line_attr_val) = decl_line_attr_opt {
+                line_number = line_attr_val.udata_value();
             }
 
-            let decl_file_attr = die.attr_value(gimli::DW_AT_decl_file).ok().flatten();
-            let file_index_opt: Option<u64> = match decl_file_attr {
+            let file_index_opt: Option<u64> = match decl_file_attr_opt {
                 Some(AttributeValue::FileIndex(val)) => Some(val),
                 Some(AttributeValue::Udata(val)) => Some(val),
                 Some(AttributeValue::Sdata(val)) => Some(val as u64),
@@ -199,22 +239,15 @@ fn process_die_node_for_variables<'abbrev, 'unit, 'tree, 'data>(
                             let dir_index = file_entry.directory_index();
                             if dir_index != 0 {
                                 if let Some(dir_av) = lp_header.directory(dir_index) {
-                                    if let Ok(dir_slice) = dwarf.attr_string(unit, dir_av.clone()) {
-                                        let dir_part = dir_slice.to_string_lossy();
-                                        if !dir_part.is_empty() {
-                                            path_str.push_str(&dir_part);
-                                            if !dir_part.ends_with('/') && !dir_part.ends_with('\\') { path_str.push('/'); }
-                                        }
+                                    if let Ok(dir_s) = dwarf.attr_string(unit, dir_av.clone()) { 
+                                        let dir_part = dir_s.to_string_lossy();
+                                        if !dir_part.is_empty() { path_str.push_str(&dir_part); if !dir_part.ends_with('/') {path_str.push('/');} }
                                     }
                                 }
                             }
-                            if let Ok(file_slice) = dwarf.attr_string(unit, file_entry.path_name()) {
-                                path_str.push_str(&file_slice.to_string_lossy());
-                            }
+                            if let Ok(file_s) = dwarf.attr_string(unit, file_entry.path_name()) { path_str.push_str(&file_s.to_string_lossy());}
 
-                            if !path_str.is_empty() {
-                                file_name = Some(path_str);
-                            }
+                            if !path_str.is_empty() { file_name = Some(path_str); }
                          }
                      }
                 }
@@ -222,9 +255,12 @@ fn process_die_node_for_variables<'abbrev, 'unit, 'tree, 'data>(
 
 
             let mut var_address: Option<u64> = None;
-            if let AttributeValue::Exprloc(expr) = loc_av {
+            if let AttributeValue::Exprloc(expr) = loc_av_val {
                 var_address = evaluate_simple_address_expr(expr, unit.encoding());
+            } else if let AttributeValue::LocationListsRef(_offset) = loc_av_val {
+                 // Location lists are complex, not handled for simplicity
             }
+
 
             if let Some(address) = var_address {
                 walk_type_die(
@@ -255,7 +291,6 @@ fn evaluate_simple_address_expr(expr: Expression<EndianSlice<RunTimeEndian>>, en
     None
 }
 
-// walk_type_die: Cleaned up logs
 fn walk_type_die<'data>(
     dwarf: &Dwarf<EndianSlice<'data, RunTimeEndian>>,
     unit: &Unit<EndianSlice<'data, RunTimeEndian>, usize>,
@@ -269,14 +304,14 @@ fn walk_type_die<'data>(
 ) {
     if depth > MAX_RECURSION_DEPTH {
         warn!("Max recursion depth reached for path: {}", current_path);
-        results.push(BaseVariableInfo { name: format!("{}.<max_depth>", current_path), type_name: "RECURSION_LIMIT".into(), address: current_address, size: 0, file_name: decl_file_name, line_number: decl_line_number });
+        results.push(BaseVariableInfo { name: format!("{}.<max_depth>", current_path), type_name: "RECURSION_LIMIT".into(), address: current_address, size: 0, file_name: decl_file_name.clone(), line_number: decl_line_number });
         return;
     }
 
-    let unit_offset = match type_offset.to_unit_offset(&unit.header) { Some(uo) => uo, None => return };
-    let type_die = match unit.entry(unit_offset) { Ok(die) => die, Err(_) => return };
+    let unit_offset = match type_offset.to_unit_offset(&unit.header) { Some(uo) => uo, None => { /* warn! for path */ return; } };
+    let type_die = match unit.entry(unit_offset) { Ok(die) => die, Err(_) => { /* error! for path */ return; } };
 
-    let type_name_attr_val = type_die.attr_value(gimli::DW_AT_name).unwrap_or(None);
+    let type_name_attr_val = type_die.attr_value(gimli::DW_AT_name).ok().flatten();
     let type_name_str = type_name_attr_val
         .and_then(|val| dwarf.attr_string(unit, val).ok())
         .map(|s| s.to_string_lossy().into_owned());
@@ -308,8 +343,8 @@ fn walk_type_die<'data>(
             });
         }
         gimli::DW_TAG_array_type => {
-            let element_type_attr = type_die.attr_value(gimli::DW_AT_type).ok().flatten();
-            let element_type_offset_ref = match element_type_attr { Some(AttributeValue::UnitRef(offset)) => offset, _ => return };
+            let element_type_attr_opt = type_die.attr_value(gimli::DW_AT_type).ok().flatten();
+            let element_type_offset_ref = match element_type_attr_opt { Some(AttributeValue::UnitRef(offset)) => offset, _ => return };
             let element_type_dio = match element_type_offset_ref.to_debug_info_offset(&unit.header) { Some(dio) => dio, _ => return };
 
             let element_byte_size = get_type_size(dwarf, unit, element_type_dio, 0).unwrap_or(0);
@@ -352,7 +387,7 @@ fn walk_type_die<'data>(
                 .map_or(false, |attr| matches!(attr, AttributeValue::Flag(true)));
 
             if is_declaration && type_byte_size == 0 {
-                results.push(BaseVariableInfo { name: current_path, type_name: format!("incomplete {}", name), address: current_address, size: 0, file_name: decl_file_name, line_number: decl_line_number });
+                results.push(BaseVariableInfo { name: current_path, type_name: format!("incomplete {}", name), address: current_address, size: 0, file_name: decl_file_name.clone(), line_number: decl_line_number });
                 return;
             }
 
@@ -363,14 +398,14 @@ fn walk_type_die<'data>(
                 let member_die = child_node.entry();
                 if member_die.tag() == gimli::DW_TAG_member {
                     has_members = true;
-                    let member_name_attr = member_die.attr_value(gimli::DW_AT_name).ok().flatten();
-                    let member_name = member_name_attr
+                    let member_name_attr_opt = member_die.attr_value(gimli::DW_AT_name).ok().flatten();
+                    let member_name = member_name_attr_opt
                         .and_then(|val| dwarf.attr_string(unit, val).ok())
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| format!("<anon_member_offset_{:?}>", member_die.offset().0));
 
-                    let member_type_attr = member_die.attr_value(gimli::DW_AT_type).ok().flatten();
-                    let member_type_offset_ref = match member_type_attr { Some(AttributeValue::UnitRef(offset)) => offset, _ => continue };
+                    let member_type_attr_opt = member_die.attr_value(gimli::DW_AT_type).ok().flatten();
+                    let member_type_offset_ref = match member_type_attr_opt { Some(AttributeValue::UnitRef(offset)) => offset, _ => continue };
                     let member_type_dio = match member_type_offset_ref.to_debug_info_offset(&unit.header) { Some(dio) => dio, _ => continue };
 
                     let member_offset_in_parent = member_die.attr_value(gimli::DW_AT_data_member_location).ok().flatten()
@@ -392,22 +427,19 @@ fn walk_type_die<'data>(
             if !has_members && type_byte_size > 0 {
                  results.push(BaseVariableInfo {
                     name: current_path, type_name: name, address: current_address,
-                    size: type_byte_size, file_name: decl_file_name, line_number: decl_line_number,
+                    size: type_byte_size, file_name: decl_file_name.clone(), line_number: decl_line_number,
                 });
             }
         }
         gimli::DW_TAG_typedef => {
-            // let typedef_name = type_name_str.unwrap_or_else(|| "anonymous_typedef".into());
             if let Some(AttributeValue::UnitRef(actual_type_offset_ref)) = type_die.attr_value(gimli::DW_AT_type).ok().flatten() {
                  if let Some(actual_type_dio) = actual_type_offset_ref.to_debug_info_offset(&unit.header) {
                     walk_type_die(dwarf, unit, actual_type_dio, current_path, current_address, results, depth, decl_file_name, decl_line_number);
                 } else {
-                     // warn!("Typedef {} has invalid underlying type offset", typedef_name);
-                     results.push(BaseVariableInfo { name: current_path, type_name: format!("unresolved_typedef_{}", type_name_str.unwrap_or_default()), address: current_address, size: 0, file_name: decl_file_name, line_number: decl_line_number });
+                     results.push(BaseVariableInfo { name: current_path, type_name: format!("unresolved_typedef_{}", type_name_str.unwrap_or_default()), address: current_address, size: 0, file_name: decl_file_name.clone(), line_number: decl_line_number });
                 }
             } else {
-                 // warn!("Typedef {} has no underlying type attribute", typedef_name);
-                results.push(BaseVariableInfo { name: current_path, type_name: format!("unresolved_typedef_{}", type_name_str.unwrap_or_default()), address: current_address, size: 0, file_name: decl_file_name, line_number: decl_line_number });
+                results.push(BaseVariableInfo { name: current_path, type_name: format!("unresolved_typedef_{}", type_name_str.unwrap_or_default()), address: current_address, size: 0, file_name: decl_file_name.clone(), line_number: decl_line_number });
             }
         }
         gimli::DW_TAG_enumeration_type => {
@@ -415,7 +447,7 @@ fn walk_type_die<'data>(
                 name: current_path,
                 type_name: type_name_str.unwrap_or_else(|| "enum".into()),
                 address: current_address, size: type_byte_size,
-                file_name: decl_file_name, line_number: decl_line_number,
+                file_name: decl_file_name.clone(), line_number: decl_line_number,
             });
         }
         gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type => {
@@ -423,16 +455,14 @@ fn walk_type_die<'data>(
                  if let Some(actual_type_dio) = actual_type_offset_ref.to_debug_info_offset(&unit.header) {
                     walk_type_die(dwarf, unit, actual_type_dio, current_path, current_address, results, depth, decl_file_name, decl_line_number);
                 }
-            } else {
-                 // warn!("CVR-qualified type at path {} has no underlying type", current_path);
             }
         }
-        _ => { // Default case for unhandled tags
+        _ => { 
             results.push(BaseVariableInfo {
                 name: current_path,
                 type_name: type_name_str.unwrap_or_else(||format!("{:?}", type_die.tag())),
                 address: current_address, size: type_byte_size,
-                file_name: decl_file_name, line_number: decl_line_number,
+                file_name: decl_file_name.clone(), line_number: decl_line_number,
             });
         }
     }
